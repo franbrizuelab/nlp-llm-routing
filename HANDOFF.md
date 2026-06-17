@@ -1,76 +1,90 @@
 # HANDOFF — LLM Routing project (continue here)
 
-Context for a fresh Claude session on the lab machine (has a **3080**). Read this
-top-to-bottom, then run the commands in "Next steps".
+Context for a fresh Claude session **on the 3080 lab machine**. Read top-to-bottom,
+then run "Next steps". Deadline: **2026-06-26 23:59** (E3 + Kaggle).
 
 ## The competition
-- Route each query to 1 of **11 models** (Model_A..Model_K) to maximize
-  **Reward_{0.85} = 0.85 · mean(perf_chosen) − 0.15 · (mean(cost_chosen) / C_max)**.
-- `data/train.csv` (10,182 rows): ID, query, and perf+cost for all 11 models.
+- Route each query to 1 of **11 models** (Model_A..Model_K) to maximize **Reward_{0.85}**.
+- `data/train.csv` (10,182 rows): ID, query, perf+cost for all 11 models.
 - `data/test.csv` (2,550 rows): ID + query only. Predict `pred_model` per row.
-- Metric details + helpers in `src/metric.py`. Spec: `2026INLPFinalProject_LLMRouting.txt`.
 - Kaggle: kernel `franbrizuelab/nlp-llm-routing-tier1`, dataset
-  `franbrizuelab/nlp-llm-routing-data`. Max 3 submissions/day.
+  `franbrizuelab/nlp-llm-routing-data`. **Max 3 submissions/day; pick 2 for private LB.**
+- Grading: Kaggle 70% (over strong baseline=55pts, over simple=40), report 30% (needs a
+  table comparing all methods tried).
 
-## Where we are (the problem)
-Current Kaggle score = **0.42**, which is **WORSE than trivial baselines**.
-Measured on train (no embeddings needed):
+## ⚠️ THE CRITICAL FACT (metric was misread for weeks)
+The real Kaggle metric **penalizes cost PER-QUERY**, not by a giant global constant.
+Proof: a CONSTANT `always-Model_F` submission scored **0.36** on Kaggle. A constant
+can't overfit, so our local metric was wrong. The metric that reproduces the LB is:
 
-| Strategy                         | Reward |
-|----------------------------------|--------|
-| Oracle (per-query best, ceiling) | 0.686  |
-| **Always Model_F** (best const)  | **0.494** |
-| Always Model_H                   | 0.492  |
-| Always Model_K                   | 0.452  |
-| **Deployed router**              | **0.42** |
-| Random                           | 0.388  |
+    Reward = 0.85*perf - 0.15*(cost / max_cost_over_models_for_that_query)
 
-**Root cause:** the deployed notebook (`kaggle_stage/kernel/tier1.ipynb`) regresses
-**22 targets** (11 perf + 11 cost) from query embeddings, then routes by
-`argmax(p̂ − α·ĉ)`. Errors across 22 noisy regressors compound → per-query choice
-is near-random → worse than a smart constant. **The routing is adding noise.**
+Consequences (computed on train, all confirmed in `notebooks/train_deberta_router.py`):
+- **always-F = 0.3725** (F is the MOST EXPENSIVE model -> WORST safe choice). Matches the 0.36 LB.
+- **always-K = 0.4509** (cheapest-decent model -> the TRUE floor / simple baseline to beat).
+- **oracle (cheapest-among-perf-best) = 0.6774** (ceiling).
+- A perfect perf-predictor + our routing rule = **0.6531** (realistic policy ceiling).
 
-Oracle pick distribution (why a classifier should work): K=5172, C=1151, D=1087,
-E=680, J=600, H=405, F=365, I=224, G=211, B=208, A=79. Very learnable IF the query
-text carries signal. `C_max` (global max cost cell) = 1.376.
+So: **never fall back to Model_F. Fall back to Model_K.** Don't model cost for routing
+(test has no cost cols and you don't need it). The oracle LABEL is metric-invariant, so
+predicting performance well + "cheapest among predicted-best" is correct under true scoring.
 
-## The plan (fix it with evidence)
-1. **Safety submission first:** always `Model_F` → ~0.49, banks a score above 0.42.
-2. **Reframe as classification:** predict the oracle's best-model label directly from
-   the embedding (one classifier), instead of 22 regressions. This is the main fix.
-3. **Also try KNN** (route by nearest train queries' oracle labels).
-4. Use a **stronger embedding model** now that we have GPU (see embed.py).
-5. CV-compare all of them with `notebooks/router_compare.py` (5-fold, reports reward).
-   Pick the winner, regenerate `submission.csv`, submit.
+## What's been tried (Kaggle LB)
+| Submission                         | LB score | Note |
+|------------------------------------|----------|------|
+| 22-target regression router        | 0.42     | compounding regressor noise |
+| always-Model_F                     | 0.36     | F is the cost trap |
+| classifier w/ 0.99 threshold->F    | 0.37     | stayed on F ~every row = always-F in disguise |
+| **always-Model_K (DO THIS NEXT)**  | ~0.45?   | new floor; confirms the metric theory |
 
-## Next steps (run these)
+## The plan: Part B = fine-tuned DeBERTa-v3 perf predictor
+File: **`notebooks/train_deberta_router.py`** (ready, logic smoke-tested).
+- Predicts each model's **ternary** perf {0,0.5,1.0} via an `11x3` head (perf is discrete!).
+- Routes by **cheapest-among-predicted-best** (median-cost lookup), **K fallback** when weak.
+- Validation reward uses the **per-query cost normalization** above (trustworthy CV).
+- Smart bits baked in: focal loss, **regret weighting vs always-K** (focuses the decisive
+  ~28% of queries where K isn't best), token-packing + `<LARGE_DATA_BLOCK>` for 962k-char
+  outliers, optional surface features (math/latex/code/lang).
+
+## Next steps (run on the 3080)
 ```bash
-# 0. data: already in data/ if pulled; else: kaggle datasets download -d franbrizuelab/nlp-llm-routing-data -p data --unzip
-pip install -q sentence-transformers lightgbm scikit-learn
+pip install -q sentencepiece transformers torch scikit-learn pandas numpy
+# data: kaggle datasets download -d franbrizuelab/nlp-llm-routing-data -p data --unzip  (if missing)
 
-# 1. Embed on the 3080 (~1-2 min). Try a strong model:
-python notebooks/embed.py BAAI/bge-large-en-v1.5      # or bge-base-en-v1.5 to start
+# 0. SAFETY SUBMIT FIRST: always-K (~0.45). Confirms metric + banks a score >> 0.37.
+python3 -c "import pandas as pd; te=pd.read_csv('data/test.csv'); \
+pd.DataFrame({'ID':te.ID,'pred_model':'Model_K'}).to_csv('submission.csv',index=False)"
+#   -> submit submission.csv to Kaggle, verify it lands ~0.45.
 
-# 2. Head-to-head CV of routing strategies (reads notebooks/Xtr.npy):
-python notebooks/router_compare.py
-#    -> table of mean reward per strategy. Anything beating 0.494 is real progress.
+# 1. Train Part B (base first; writes submission.csv + prints val_reward & route dist):
+python notebooks/train_deberta_router.py --epochs 3
 
-# 3. Build submission from the winning strategy, write submission.csv, submit to Kaggle.
+# 2. Trustworthy 5-fold CV under the corrected metric:
+python notebooks/train_deberta_router.py --cv --epochs 3
+
+# 3. If base CV beats ~0.45 clearly, try large:
+python notebooks/train_deberta_router.py --large --epochs 4 --batch 8
 ```
+Tune on CV (top of the script): `EPS_TIE`, `TAU_WEAK`, `--gamma`, `--regret`, `--no_surf`.
+
+## Submission strategy (50/50 public/private, choose 2)
+Hedge: pick **always-K (~0.45 safe)** as one private submission and the **best Part-B
+router** as the other. Trust CV over the public LB (public is only 1,275 queries).
 
 ## Key facts / gotchas
-- 3080 is great here: embedding/inference only needs ~1–2 GB VRAM (NOT LLM fine-tuning).
-  Its 10 GB easily fits bge-large / e5-large / gte-large / even bge-m3.
-- GPU helps **embedding only**. The classifier/GBM is CPU and fast at this scale.
-- Kaggle accelerator type (T4 vs P100 vs TPU) is a **UI-only** session setting; the CLI
-  push can't lock it. Pick "GPU T4 x2" in the editor before running. The notebook's
-  `_pick_emb_device()` already falls back to CPU if torch can't run the GPU (P100=sm_60).
-- Embeddings (*.npy) are gitignored — regenerate per machine via embed.py.
-- Kaggle account here is **franbrizuelab** (an earlier run used `shincleriapr`; ignore it).
+- This file may be read on a 2GB laptop GPU (MX550) by mistake — **train on the 3080**.
+  DeBERTa-v3-base fits ~easily; large needs the 10GB + batch 8 + fp16 (script does fp16).
+- DeBERTa-v3 tokenizer **requires `sentencepiece`** (not in the base Kaggle/torch image).
+- Kaggle accelerator (T4 vs P100) is a UI-only setting; P100=sm_60 can't run the prebuilt
+  torch kernels (see git memory). For Kaggle submission, prefer T4 or precompute locally.
+- Kaggle account = **franbrizuelab** (ignore old `shincleriapr` slugs).
 
 ## Files
-- `kaggle_stage/kernel/tier1.ipynb` — deployed notebook (the regression-router; what scored 0.42).
-- `notebooks/embed.py` — produce cached embeddings (run first).
-- `notebooks/router_compare.py` — CV comparison of strategies.
-- `src/metric.py`, `src/route.py` — metric + local smoke router.
-- `DATA_SUMMARY_FOR_RESEARCH.md` — dataset analysis.
+- `notebooks/train_deberta_router.py` — Part B (the plan above). Start here.
+- `src/metric.py` — note: its default Cmax is the OLD global-max convention; the LB-correct
+  metric is per-query (implemented inside train_deberta_router.py as `perquery_cost_norm`).
+- `notebooks/embed.py`, `router_compare.py` — Part A (embedding classifier/kNN), still valid.
+- `DATA_SUMMARY_FOR_RESEARCH.md` — dataset analysis (note: its "cost is negligible" claim is
+  WRONG for the LB — see THE CRITICAL FACT above).
+- `LLM Routing Strategies for Weak Signals.txt` — research report (mechanistic/lookahead
+  routing in it are NOT applicable: the 11 models are anonymous, no activations available).
