@@ -48,17 +48,14 @@ def reward_of_choice(perf_mat, cost_mat, choice_idx) -> float:
     rows = np.arange(len(choice_idx))
     return PERF_W * perf_mat[rows, choice_idx].mean() - COST_W * cn[rows, choice_idx].mean()
 
-def route_from_eperf(eperf: np.ndarray, med_cost: np.ndarray) -> np.ndarray:
-    """eperf: (N,11) predicted E[perf]. Return per-row model index.
-    Rule: cheapest model among predicted-best; if all weak, fall back to K."""
-    N = len(eperf); choice = np.empty(N, dtype=int)
+def route_from_eperf(eperf: np.ndarray, mean_norm_cost: np.ndarray) -> np.ndarray:
+    """eperf: (N,11) predicted E[perf]. mean_norm_cost: (11,) mean per-query-normalized cost.
+    Route to argmax(PERF_W*eperf - COST_W*mean_norm_cost); K fallback if all weak."""
+    eperf = np.nan_to_num(eperf, nan=0.0)
+    score = PERF_W * eperf - COST_W * mean_norm_cost[np.newaxis, :]   # (N, 11)
+    choice = score.argmax(1)
     kidx = MODELS.index(KFALL)
-    for i in range(N):
-        best = eperf[i].max()
-        if best < TAU_WEAK:
-            choice[i] = kidx; continue
-        cand = np.where(eperf[i] >= best - EPS_TIE)[0]
-        choice[i] = cand[np.argmin(med_cost[cand])]
+    choice[eperf.max(1) < TAU_WEAK] = kidx
     return choice
 
 _RE_BIGNUM  = re.compile(r"[0-9]{40,}")
@@ -129,13 +126,17 @@ class Router(nn.Module):
         return self.head(self.drop(pooled)).view(-1, 11, 3)          # (B,11,3)
 
 def focal_ce(logits, target, gamma=1.0):
-    # logits (B,11,3), target (B,11)
-    logp = F.log_softmax(logits, dim=-1)
-    p = logp.exp()
-    tgt = target.unsqueeze(-1)
-    logpt = logp.gather(-1, tgt).squeeze(-1)                          # (B,11)
-    pt = p.gather(-1, tgt).squeeze(-1)
-    return (-((1 - pt) ** gamma) * logpt)                            # (B,11) per-model loss
+    # logits (B,11,3), target (B,11) — use stable F.cross_entropy then apply focal weight
+    logits = logits.float()
+    B = logits.shape[0]
+    ce = F.cross_entropy(logits.view(B*11, 3), target.reshape(B*11),
+                         reduction='none').view(B, 11)               # (B,11) stable CE
+    if gamma > 0:
+        with torch.no_grad():
+            pt = F.softmax(logits, dim=-1).gather(-1, target.unsqueeze(-1)).squeeze(-1)
+            focal_w = (1 - pt.clamp(min=1e-6, max=1-1e-6)) ** gamma
+        ce = ce * focal_w
+    return ce                                                         # (B,11) per-model loss
 
 # ---------------------------------------------------------------- train / eval
 def make_targets(df):
@@ -164,18 +165,18 @@ def predict_eperf(model, loader, device):
         outs.append((p * PERF_VALUES).sum(-1))                        # E[perf] (B,11)
     return np.concatenate(outs)
 
-def train_one(tr_df, va_df, args, med_cost, device):
+def train_one(tr_df, va_df, args, mean_norm_cost, device):
     tok = AutoTokenizer.from_pretrained(args.backbone)
     perf_tr, cost_tr, cls_tr = make_targets(tr_df)
-    w_tr = regret_weights(perf_tr, cost_tr) if args.regret else None
+    w_tr = regret_weights(perf_tr, cost_tr) if (args.regret and not args.no_regret) else None
     ds_tr = QueryDS(tr_df["query"].tolist(), tok, args.max_len, cls_tr, w_tr)
     dl_tr = DataLoader(ds_tr, batch_size=args.batch, shuffle=True, num_workers=4, drop_last=True)
 
     model = Router(args.backbone, use_surf=not args.no_surf).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-6)
     steps = len(dl_tr) * args.epochs
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.1)
-    scaler = torch.cuda.amp.GradScaler(enabled=device == "cuda")
+    amp_ctx = torch.amp.autocast("cuda", enabled=False)  # fp32: BF16 causes NaN in DeBERTa disentangled attn
 
     best = (-1e9, None)
     va_loader = None
@@ -188,19 +189,23 @@ def train_one(tr_df, va_df, args, med_cost, device):
         model.train(); t0 = time.time(); run = 0.0
         for step, b in enumerate(dl_tr):
             opt.zero_grad()
-            with torch.cuda.amp.autocast(enabled=device == "cuda"):
+            with amp_ctx:
                 logits = model(b["input_ids"].to(device), b["attention_mask"].to(device),
                                b["surf"].to(device))
                 per_model = focal_ce(logits, b["target"].to(device), gamma=args.gamma)  # (B,11)
                 loss = (per_model.mean(1) * b["weight"].to(device)).mean()
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt); nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt); scaler.update(); sched.step()
-            run += loss.item()
+            loss.backward()
+            grads = [p.grad for p in model.parameters() if p.grad is not None]
+            if any(torch.isnan(g).any() for g in grads):
+                opt.zero_grad(); sched.step(); continue   # skip corrupt step
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step(); sched.step()
+            if not math.isnan(loss.item()):
+                run += loss.item()
         msg = f"  epoch {ep+1}/{args.epochs}  loss={run/len(dl_tr):.4f}  ({time.time()-t0:.0f}s)"
         if va_loader is not None:
             ep_va = predict_eperf(model, va_loader, device)
-            choice = route_from_eperf(ep_va, med_cost)
+            choice = route_from_eperf(ep_va, mean_norm_cost)
             r = reward_of_choice(perf_va, cost_va, choice)
             msg += f"  val_reward={r:.4f}"
             if r > best[0]:
@@ -220,6 +225,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--gamma", type=float, default=1.0, help="focal gamma (0=plain CE)")
     ap.add_argument("--regret", action="store_true", default=True)
+    ap.add_argument("--no_regret", action="store_true", help="use uniform sample weights")
     ap.add_argument("--no_surf", action="store_true")
     ap.add_argument("--cv", action="store_true", help="5-fold reward CV (no submission)")
     ap.add_argument("--seed", type=int, default=42)
@@ -231,20 +237,20 @@ def main():
 
     tr = pd.read_csv("data/train.csv")
     perf_all, cost_all, _ = make_targets(tr)
-    med_cost = cost_all.mean(0) if False else np.median(np.where(cost_all > 0, cost_all, np.nan), axis=0)
-    med_cost = np.nan_to_num(med_cost, nan=cost_all.mean())          # per-model median cost lookup
+    mean_norm_cost = perquery_cost_norm(cost_all).mean(0)             # (11,) mean normalized cost per model
 
     # reference points under the TRUE (per-query-normalized) metric
     print("always-K reward:", round(reward_of_choice(perf_all, cost_all,
           np.full(len(tr), MODELS.index("K"))), 4))
     print("oracle reward:  ", round(reward_of_choice(perf_all, cost_all,
           (PERF_W*perf_all - COST_W*perquery_cost_norm(cost_all)).argmax(1)), 4))
+    print("mean_norm_cost: ", dict(zip(MODELS, mean_norm_cost.round(4))))
 
     if args.cv:
         kf = KFold(5, shuffle=True, random_state=args.seed); scores = []
         for f, (tri, vai) in enumerate(kf.split(tr)):
             print(f"--- fold {f} ---")
-            _, _, r = train_one(tr.iloc[tri], tr.iloc[vai], args, med_cost, device)
+            _, _, r = train_one(tr.iloc[tri], tr.iloc[vai], args, mean_norm_cost, device)
             scores.append(r)
         print(f"\nCV reward = {np.mean(scores):.4f} +/- {np.std(scores):.4f}")
         return
@@ -252,14 +258,14 @@ def main():
     # holdout train + test submission
     n = len(tr); idx = np.random.permutation(n); cut = int(n * 0.9)
     tr_df, va_df = tr.iloc[idx[:cut]], tr.iloc[idx[cut:]]
-    model, tok, r = train_one(tr_df, va_df, args, med_cost, device)
+    model, tok, r = train_one(tr_df, va_df, args, mean_norm_cost, device)
     print(f"best val reward = {r:.4f}")
 
     te = pd.read_csv("data/test.csv")
     ds_te = QueryDS(te["query"].tolist(), tok, args.max_len)
     dl_te = DataLoader(ds_te, batch_size=args.batch * 2, num_workers=4)
     ep_te = predict_eperf(model, dl_te, device)
-    choice = route_from_eperf(ep_te, med_cost)
+    choice = route_from_eperf(ep_te, mean_norm_cost)
     sub = pd.DataFrame({"ID": te["ID"], "pred_model": [f"Model_{MODELS[c]}" for c in choice]})
     sub.to_csv("submission.csv", index=False)
     torch.save(model.state_dict(), "notebooks/deberta_router.pt")
