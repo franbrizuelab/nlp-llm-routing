@@ -1,0 +1,16 @@
+# Credentials — never commit
+kaggle.json
+*.pem
+*.key
+.env
+
+# Artifacts
+submission*.csv
+*.npy
+emb_*.npy
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Kaggle staging
+kaggle_stage/

@@ -1,0 +1,15 @@
+{
+  "id": "franbrizuelab/nlp-llm-routing-tier1",
+  "title": "NLP LLM Routing Tier1",
+  "code_file": "tier1.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "franbrizuelab/nlp-llm-routing-data"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
