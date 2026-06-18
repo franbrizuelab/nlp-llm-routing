@@ -29,6 +29,12 @@ Performance is discrete {0.0, 0.5, 1.0}. Cost is continuous, ~length-driven.
 | always-F | 0.3725 | **0.36** | +0.012 |
 | always-K | 0.4509 | **0.44** | +0.011 |
 | bge K/H router | 0.4747 | **0.43** | **+0.045** |
+| e5 conservative router (margin .03) | 0.4808 | **0.44** | **+0.041** |
+
+**The e5 router (CV 0.4808) scored exactly always-K (0.44).** Even conservative routing
+adds ZERO net LB value — the CV edge is entirely overfitting. Confirms: the routing signal
+in our features does not transfer. Reshuffling features/models won't fix this; only NEW,
+transferable information can (see §7).
 
 **Two constants agree: our CV is ~0.011 optimistic (a small, stable metric offset).**
 The router's gap is 0.045 → the extra ~0.034 is **overfitting**. And always-K (0.44)
@@ -170,3 +176,23 @@ Untested lever with upside:
 
 Realistic ceiling if metric holds: ~0.46–0.50 LB. The rest of the gap to oracle (0.68) is
 the factual-recall lottery (§3a) and is not reachable from query text alone.
+
+---
+
+## 7. LLM-feature idea (DeepSeek) — adds INFORMATION, the real bottleneck
+
+Since routing on our features adds zero LB value (§1), the only thing that can help is
+**new transferable signal**. An external LLM CANNOT predict per-model success (models are
+anonymous A–K). What it CAN provide is signal about the QUERY:
+- difficulty / "would a small model answer this?" (robust low-dim → should transfer better
+  than overfit-prone embeddings)
+- category (factual-recall-obscure vs reasoning/code/math) → identify lottery queries (§3a)
+  and deliberately keep them on K.
+
+Pilot (fail fast, cheap) before committing to ~15k calls:
+- `notebooks/deepseek_features.py` (reads DEEPSEEK_API_KEY env; OpenAI-compatible client):
+  per query -> JSON {category, difficulty 1-5, obscure_knowledge, small_model_can_answer}.
+- Run ~2500 train queries, `notebooks/deepseek_eval.py` measures OOF reward with/without.
+- Ship to full set only if the pilot lifts held-out reward meaningfully.
+Expectation: helps only the difficulty-driven subset; cannot crack the factual lottery.
+Models: deepseek-chat (V3, cheap) or deepseek-reasoner (R1, better difficulty, pricier).
